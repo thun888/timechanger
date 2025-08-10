@@ -2,8 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"runtime"
 	"time"
@@ -23,18 +24,85 @@ type BilibiliTimeResponse struct {
 }
 
 func main() {
-	// 调用API获取时间
-	dateTime := GetBilibiliTime()
+	// 解析命令行参数
+	jumpTimePtr := flag.Float64("jumptime", 0, "跳转时间(小时为单位)")
+	flag.Parse()
+
+	// 如果指定了jumptime参数
+	if *jumpTimePtr != 0 {
+		// 获取当前时间并添加偏移量
+		currentTime := time.Now()
+		hoursToAdd := time.Duration(*jumpTimePtr * float64(time.Hour))
+		newTime := currentTime.Add(hoursToAdd)
+
+		// 格式化时间并更新系统时间
+		dateTime := newTime.Format("2006-01-02 15:04:05")
+		if UpdateSystemDate(dateTime) {
+			glog.Info("已成功将系统时间调整 ", *jumpTimePtr, " 小时")
+		} else {
+			glog.Error("调整系统时间失败")
+		}
+		return
+	}
+
+	// 调用API获取时间，无限重试直到成功
+	dateTime := GetBilibiliTimeWithRetry()
 	if dateTime != "" {
-		UpdateSystemDate(dateTime)
+		// 解析从B站获取的时间字符串
+		biliTime, err := time.ParseInLocation("2006-01-02 15:04:05", dateTime, time.Local)
+		if err != nil {
+			glog.Error("解析B站时间失败:", err)
+			return
+		}
+
+		// 获取当前系统时间
+		localTime := time.Now()
+
+		// 计算时间差异，显示绝对值和方向
+		timeDiff := localTime.Sub(biliTime)
+		diffDirection := "快"
+		if timeDiff < 0 {
+			timeDiff = -timeDiff
+			diffDirection = "慢"
+		}
+
+		// 更新系统时间
+		if UpdateSystemDate(dateTime) {
+			glog.Info(fmt.Sprintf("系统时间已校准，校准前系统时间%s了 %v", diffDirection, timeDiff))
+		} else {
+			glog.Error("调整系统时间失败")
+		}
 	} else {
 		glog.Info("未能获取到有效的时间")
 	}
 }
 
+// GetBilibiliTimeWithRetry 带无限重试功能的哔哩哔哩时间获取
+func GetBilibiliTimeWithRetry() string {
+	retryCount := 0
+	for {
+		dateTime := GetBilibiliTime()
+		if dateTime != "" {
+			if retryCount > 0 {
+				glog.Info(fmt.Sprintf("在尝试%d次后成功获取时间", retryCount+1))
+			}
+			return dateTime
+		}
+
+		retryCount++
+		glog.Info(fmt.Sprintf("第%d次请求失败，15秒后重试...", retryCount))
+		time.Sleep(15 * time.Second) // 重试前等待15秒
+	}
+}
+
 func GetBilibiliTime() string {
+	// 创建带超时的HTTP客户端
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
 	// 发送HTTP请求
-	resp, err := http.Get("https://api.bilibili.com/x/report/click/now")
+	resp, err := client.Get("http://api.bilibili.com/x/report/click/now")
 	if err != nil {
 		glog.Error("请求失败:", err)
 		return ""
@@ -42,7 +110,7 @@ func GetBilibiliTime() string {
 	defer resp.Body.Close()
 
 	// 读取响应内容
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		glog.Error("读取响应内容失败:", err)
 		return ""
@@ -62,14 +130,22 @@ func GetBilibiliTime() string {
 	}
 
 	// 将时间戳转换为本地时间格式
-	biliTime := time.Unix(timeResponse.Data.Now, 0)
+	biliTime := time.Unix(timeResponse.Data.Now, 0).Local()
 	return biliTime.Format("2006-01-02 15:04:05")
 }
 
 func UpdateSystemDate(dateTime string) bool {
 	// 获取当前系统时间
 	oldTime := time.Now()
-	fmt.Println("原先的系统时间:", oldTime.Format("2006-01-02 15:04:05"))
+	glog.Info("原先的系统时间:", oldTime.Format("2006-01-02 15:04:05"))
+
+	// 解析目标时间 - 使用本地时区
+	targetTime, err := time.ParseInLocation("2006-01-02 15:04:05", dateTime, time.Local)
+	if err != nil {
+		glog.Error("解析目标时间失败:", err)
+		return false
+	}
+	glog.Info("目标时间:", dateTime)
 
 	system := runtime.GOOS
 	var success bool
@@ -103,11 +179,16 @@ func UpdateSystemDate(dateTime string) bool {
 	if success {
 		// 获取更改后的系统时间
 		newTime := time.Now()
-		fmt.Println("更改后的系统时间:", newTime.Format("2006-01-02 15:04:05"))
+		glog.Info("更改后的系统时间:", newTime.Format("2006-01-02 15:04:05"))
 
-		// // 计算时间偏差
-		// timeDifference := newTime.Sub(oldTime)
-		// fmt.Println("时间偏差:", timeDifference)
+		// 计算与目标时间的误差，显示绝对值和方向
+		timeDifference := newTime.Sub(targetTime)
+		diffDirection := "快"
+		if timeDifference < 0 {
+			timeDifference = -timeDifference
+			diffDirection = "慢"
+		}
+		glog.Info(fmt.Sprintf("校准后系统时间%s了 %v", diffDirection, timeDifference))
 		return true
 	}
 
